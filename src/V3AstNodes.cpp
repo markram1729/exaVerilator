@@ -2604,6 +2604,8 @@ void AstVar::dump(std::ostream& str) const {
     if (isPulldown()) str << " [PULLDOWN]";
     if (isUsedClock()) str << " [CLK]";
     if (isSigPublic()) str << " [P]";
+    if (isSigUserRdPublic()) str << " [PRD]";
+    if (isSigUserRWPublic()) str << " [PWR]";
     if (isInternal()) str << " [INTERNAL]";
     if (isLatched()) str << " [LATCHED]";
     if (isUsedLoopIdx()) str << " [LOOP]";
@@ -3176,6 +3178,20 @@ void AstDelay::dump(std::ostream& str) const {
 void AstDelay::dumpJson(std::ostream& str) const {
     dumpJsonBoolFunc(str, isCycleDelay);
     dumpJsonGen(str);
+}
+
+const char* AstDisable::broken() const {
+    BROKEN_RTN((m_targetp && targetRefp()) || ((!m_targetp && !targetRefp())));
+    return nullptr;
+}
+void AstDisable::dump(std::ostream& str) const {
+    this->AstNodeStmt::dump(str);
+    str << " -> ";
+    if (targetp()) {
+        targetp()->dump(str);
+    } else {
+        str << "UNLINKED";
+    }
 }
 const char* AstAnd::widthMismatch() const VL_MT_STABLE {
     BROKEN_RTN(lhsp()->widthMin() != rhsp()->widthMin());

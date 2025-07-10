@@ -2365,6 +2365,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
         bool m_unresolvedClass;  // Unresolved class reference, needs help from V3Param
         bool m_genBlk;  // Contains gen block reference
         AstNode* m_unlinkedScopep;  // Unresolved scope, needs corresponding VarXRef
+        AstDisable* m_disablep;  // Disable statement under which the reference is
         bool m_dotErr;  // Error found in dotted resolution, ignore upwards
         string m_dotText;  // String of dotted names found in below parseref
         DotStates() { init(nullptr); }
@@ -2380,6 +2381,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
             m_unresolvedClass = false;
             m_genBlk = false;
             m_unlinkedScopep = nullptr;
+            m_disablep = nullptr;
         }
         string ascii() const {
             static const char* const names[]
@@ -2762,7 +2764,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                 if (nodep->name() == "__paramNumber1" && m_cellp
                     && VN_IS(m_cellp->modp(), Primitive)) {
                     // Primitive parameter is really a delay we can just ignore
-                    VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+                    VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
                     return;
                 } else {
                     const string suggest
@@ -3084,7 +3086,11 @@ class LinkDotResolveVisitor final : public VNVisitor {
             bool allowVar = false;
             bool allowFTask = false;
             bool staticAccess = false;
-            if (m_ds.m_dotPos == DP_PACKAGE) {
+            if (m_ds.m_disablep) {
+                allowScope = true;
+                allowFTask = true;
+                expectWhat = "block/task";
+            } else if (m_ds.m_dotPos == DP_PACKAGE) {
                 // {package-or-class}::{a}
                 AstNodeModule* classOrPackagep = nullptr;
                 expectWhat = "scope/variable/func";
@@ -3185,7 +3191,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                 }
             }
             if (!foundp) {
-            } else if (VN_IS(foundp->nodep(), Cell) || VN_IS(foundp->nodep(), Begin)
+            } else if (VN_IS(foundp->nodep(), Cell) || VN_IS(foundp->nodep(), NodeBlock)
                        || VN_IS(foundp->nodep(), Netlist)  // for $root
                        || VN_IS(foundp->nodep(), Module)) {  // if top
                 if (allowScope) {
@@ -3193,8 +3199,20 @@ class LinkDotResolveVisitor final : public VNVisitor {
                     m_ds.m_dotText = VString::dot(m_ds.m_dotText, ".", nodep->name());
                     m_ds.m_dotSymp = foundp;
                     m_ds.m_dotPos = DP_SCOPE;
+                    if (m_ds.m_disablep && VN_IS(foundp->nodep(), NodeBlock)) {
+                        // Possibly it is not the final link. If we are under dot and not in its
+                        // last component, `targetp()` field will be overwritten by next components
+                        m_ds.m_disablep->targetp(foundp->nodep());
+                    }
                     if (const AstBegin* const beginp = VN_CAST(foundp->nodep(), Begin)) {
-                        if (beginp->generate()) m_ds.m_genBlk = true;
+                        if (beginp->generate()) {
+                            m_ds.m_genBlk = true;
+                            if (m_ds.m_disablep) {
+                                m_ds.m_disablep->v3warn(
+                                    E_UNSUPPORTED,
+                                    "Unsupported: Generate block referenced by disable");
+                            }
+                        }
                     }
                     // Upper AstDot visitor will handle it from here
                 } else if (VN_IS(foundp->nodep(), Cell) && allowVar) {
@@ -3231,7 +3249,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                     taskrefp = new AstFuncRef{nodep->fileline(), nodep->name(), nullptr};
                 }
                 nodep->replaceWith(taskrefp);
-                VL_DO_DANGLING(nodep->deleteTree(), nodep);
+                VL_DO_DANGLING(pushDeletep(nodep), nodep);
                 m_ds = lastStates;
                 return;
             } else if (AstVar* const varp = foundToVarp(foundp, nodep, VAccess::READ)) {
@@ -3438,7 +3456,8 @@ class LinkDotResolveVisitor final : public VNVisitor {
                     m_ds.m_dotPos = DP_MEMBER;
                 } else {
                     // Cells/interfaces can't be implicit
-                    const bool checkImplicit = (!m_ds.m_dotp && m_ds.m_dotText == "" && !foundp);
+                    const bool checkImplicit
+                        = (!m_ds.m_dotp && m_ds.m_dotText == "" && !m_ds.m_disablep && !foundp);
                     const bool err
                         = !(checkImplicit && m_statep->implicitOk(m_modp, nodep->name()));
                     if (err) {
@@ -3665,7 +3684,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                             AstVarRef* const newrefp
                                 = new AstVarRef{nodep->fileline(), nodep->varp(), nodep->access()};
                             nodep->replaceWith(newrefp);
-                            VL_DO_DANGLING(nodep->deleteTree(), nodep);
+                            VL_DO_DANGLING(pushDeletep(nodep), nodep);
                         }
                     }
                 }
@@ -3693,7 +3712,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                     AstVarRef* const newvscp
                         = new AstVarRef{nodep->fileline(), vscp, nodep->access()};
                     nodep->replaceWith(newvscp);
-                    VL_DO_DANGLING(nodep->deleteTree(), nodep);
+                    VL_DO_DANGLING(pushDeletep(nodep), nodep);
                     UINFO(9, indent() << "new " << newvscp);  // Also prints taskp
                 }
             }
@@ -3845,7 +3864,8 @@ class LinkDotResolveVisitor final : public VNVisitor {
             // HERE function() . method_called_on_function_return_value()
             m_ds.m_dotPos = DP_MEMBER;
             m_ds.m_dotText = "";
-        } else {
+        } else if (!m_ds.m_disablep) {
+            // visit(AstDisable*) setup the dot handling
             checkNoDot(nodep);
         }
         if (nodep->classOrPackagep() && nodep->taskp()) {
@@ -3983,7 +4003,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                                     AstNode* addp = pinp;
                                     if (AstArg* const argp = VN_CAST(pinp, Arg)) {
                                         addp = argp->exprp()->unlinkFrBack();
-                                        VL_DO_DANGLING(pinp->deleteTree(), pinp);
+                                        VL_DO_DANGLING(pushDeletep(pinp), pinp);
                                     }
                                     outp = AstNode::addNext(outp, addp);
                                 }
@@ -3991,7 +4011,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                                 newp->dtypep(nodep->dtypep());
                             }
                             nodep->replaceWith(newp);
-                            VL_DO_DANGLING(nodep->deleteTree(), nodep);
+                            VL_DO_DANGLING(pushDeletep(nodep), nodep);
                             return;
                         } else {
                             VSpellCheck speller;
@@ -4213,6 +4233,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
         if (nodep->classOrNullp()) return;
         LINKDOT_VISIT_START();
         if (m_statep->forPrimary()) {
+            if (nodep->childDTypep()) return;
             AstNode* cprp = nodep->classOrPkgsp();
             VSymEnt* lookSymp = m_curSymp;
             if (AstDot* const dotp = VN_CAST(cprp, Dot)) {
@@ -4431,7 +4452,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                 cpackagep->v3warn(E_UNSUPPORTED,
                                   "Unsupported: Multiple '::' package/class reference");
             }
-            VL_DO_DANGLING(cpackagep->unlinkFrBack()->deleteTree(), cpackagep);
+            VL_DO_DANGLING(pushDeletep(cpackagep->unlinkFrBack()), cpackagep);
         }
         if (m_ds.m_dotp && (m_ds.m_dotPos == DP_PACKAGE || m_ds.m_dotPos == DP_SCOPE)) {
             UASSERT_OBJ(VN_IS(m_ds.m_dotp->lhsp(), ClassOrPackageRef), m_ds.m_dotp->lhsp(),
@@ -4476,7 +4497,7 @@ class LinkDotResolveVisitor final : public VNVisitor {
                     = new AstClassRefDType{nodep->fileline(), defp, paramsp};
                 newp->classOrPackagep(foundp->classOrPackagep());
                 nodep->replaceWith(newp);
-                VL_DO_DANGLING(nodep->deleteTree(), nodep);
+                VL_DO_DANGLING(pushDeletep(nodep), nodep);
                 return;
             } else if (m_insideClassExtParam) {
                 return;
@@ -4508,25 +4529,49 @@ class LinkDotResolveVisitor final : public VNVisitor {
             taskp->dpiExport(true);
             if (nodep->cname() != "") taskp->cname(nodep->cname());
         }
-        VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+        VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
+    }
+    void visit(AstDisable* nodep) override {
+        LINKDOT_VISIT_START();
+        checkNoDot(nodep);
+        VL_RESTORER(m_ds);
+        m_ds.init(m_curSymp);
+        m_ds.m_dotPos = DP_FIRST;
+        m_ds.m_disablep = nodep;
+        iterateChildren(nodep);
+        if (nodep->targetRefp()) {
+            if (AstTaskRef* const taskRefp = VN_CAST(nodep->targetRefp(), TaskRef)) {
+                nodep->targetp(taskRefp->taskp());
+            } else if (!VN_IS(nodep->targetRefp(), ParseRef)) {
+                // If it is a ParseRef, either it couldn't be linked or it is linked to a block
+                nodep->v3warn(E_UNSUPPORTED, "Node of type "
+                                                 << nodep->targetRefp()->prettyTypeName()
+                                                 << " referenced by disable");
+                pushDeletep(nodep->unlinkFrBack());
+            }
+            if (nodep->targetp()) {
+                // If the target is already linked, there is no need to store reference as child
+                VL_DO_DANGLING(nodep->targetRefp()->unlinkFrBack()->deleteTree(), nodep);
+            }
+        }
     }
     void visit(AstPackageImport* nodep) override {
         // No longer needed
         LINKDOT_VISIT_START();
         checkNoDot(nodep);
-        VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+        VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
     }
     void visit(AstPackageExport* nodep) override {
         // No longer needed
         LINKDOT_VISIT_START();
         checkNoDot(nodep);
-        VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+        VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
     }
     void visit(AstPackageExportStarStar* nodep) override {
         // No longer needed
         LINKDOT_VISIT_START();
         checkNoDot(nodep);
-        VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+        VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
     }
     void visit(AstCellRef* nodep) override {
         LINKDOT_VISIT_START();
@@ -4648,7 +4693,7 @@ void V3LinkDot::linkDotGuts(AstNetlist* rootp, VLinkDotStep step) {
     state.computeIfaceVarSyms();
     state.computeScopeAliases();
     state.dumpSelf();
-    { LinkDotResolveVisitor{rootp, &state}; }
+    LinkDotResolveVisitor visitor{rootp, &state};
     state.dumpSelf();
 }
 
